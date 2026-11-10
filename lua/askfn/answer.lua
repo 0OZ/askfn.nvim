@@ -18,7 +18,7 @@ local MS_PER_SECOND = 1000
 ---@class askfn.AnswerView
 ---@field render fun(lines: string[]) replace the content and fit the height to it
 ---@field set_busy fun(busy: boolean) spinner and elapsed seconds in the title while busy
----@field focus_line fun(line: integer) scroll so that `line` is the top line
+---@field focus_line fun(line: integer) make `line` the top line of the window
 ---@field map fun(key: string, action: fun()) normal-mode key inside the window
 ---@field on_close fun(callback: fun()) run `callback` when the window closes
 ---@field close fun()
@@ -45,6 +45,7 @@ function M.open(opts)
   })
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
+  vim.wo[win].scrolloff = 0
   vim.bo[buf].filetype = "markdown"
 
   local resize_timer = assert(vim.uv.new_timer())
@@ -126,9 +127,9 @@ function M.open(opts)
   end
 
   local function focus_line(line)
-    vim.api.nvim_win_set_cursor(win, { line, 0 })
     vim.api.nvim_win_call(win, function()
-      vim.cmd.normal({ "zt", bang = true })
+      -- `zt` is unreliable while the window is still smaller than its content; set the view directly.
+      vim.fn.winrestview({ topline = line, lnum = line, col = 0 })
     end)
   end
 

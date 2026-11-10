@@ -2,6 +2,8 @@
 
 Ask a coding agent about the function under your cursor, without leaving the buffer.
 
+![demo](assets/demo.gif)
+
 - `af` text object: the whole function, signature included (`vaf`, `yaf`, `daf`)
 - `<leader>aq`: popup for a question about that function; in visual mode, about the selection
 - The answer streams into a floating window that grows with it; the asked code stays highlighted
@@ -82,7 +84,7 @@ require("askfn").setup({
 })
 ```
 
-The asked lines are highlighted with `AskfnTarget`, linked to `CursorLine` by default.
+The asked lines are highlighted with `AskfnTarget`, linked to `Visual` by default.
 
 ### Backends
 
@@ -109,6 +111,16 @@ handoff = function(argv)
   vim.cmd("ClaudeCodeClose")
   vim.cmd("ClaudeCode --resume " .. argv[#argv])
 end,
+```
+
+## Demo
+
+`assets/demo.gif` is recorded from a script, so it looks the same every time: a real language server,
+a stand-in agent (`demo/fake-agent.sh`) that replies with fixed text. To re-record it (needs
+[vhs](https://github.com/charmbracelet/vhs) and `lua-language-server`):
+
+```sh
+vhs demo/demo.tape
 ```
 
 ## Tests

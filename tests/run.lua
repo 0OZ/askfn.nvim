@@ -554,6 +554,24 @@ test("follow-up resumes the same session with only the new question", function()
   contains(conversation, "> and then?", "follow-up question joins the thread")
 end)
 
+test("follow-up scrolls its question to the top when the thread outgrows the window", function()
+  -- Short first answer, long follow-up: the window is still small when the second question is added.
+  local short_then_long = 'case "$*" in *--continue-sid*) for n in $(seq 1 40); do echo $n; sleep 0.01; done;; *) echo short;; esac'
+  use_agent({ cmd = { "sh", "-c", short_then_long, "sh" }, output = "text", session = SESSION }, true)
+  open_source({ ADD })
+  ask("first?")
+  wait_for_buffer_text("short")
+  vim.wait(600)
+  feed("<CR>")
+  submit("second?")
+  wait_for_buffer_text("40")
+  vim.wait(600)
+  local float = vim.api.nvim_get_current_win()
+  local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  local question_line = vim.fn.index(lines, "> second?") + 1
+  eq(question_line, vim.fn.line("w0", float), "newest question is the first visible line")
+end)
+
 test("follow-up key while the agent is still answering warns", function()
   use_agent(SLOW_WITH_SESSION)
   open_source({ ADD })

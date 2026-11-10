@@ -171,7 +171,7 @@ function M.setup(opts)
   local merged = vim.tbl_deep_extend("force", defaults, opts or {})
   validate(merged)
   config = merged
-  vim.api.nvim_set_hl(0, TARGET_HIGHLIGHT, { default = true, link = "CursorLine" })
+  vim.api.nvim_set_hl(0, TARGET_HIGHLIGHT, { default = true, link = "Visual" })
 
   local keys = merged.keys
   if keys.ask then
