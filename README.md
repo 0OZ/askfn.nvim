@@ -7,6 +7,7 @@ Ask a coding agent about the function under your cursor, without leaving the buf
 - `af` text object: the whole function, signature included (`vaf`, `yaf`, `daf`)
 - `<leader>aq`: popup for a question about that function; in visual mode, about the selection
 - `<leader>aQ`: the same, with the whole file sent along as context
+- `<leader>at`: popup for a question about the class, struct, enum, trait or impl block around the cursor
 - The answer streams into a floating window that grows with it; the asked code stays highlighted
 - Follow-up questions in the same window, same agent session
 - One key to continue the conversation in an interactive agent terminal
@@ -14,6 +15,10 @@ Ask a coding agent about the function under your cursor, without leaving the buf
 
 No dependencies. Function boundaries come from the attached language server
 (`textDocument/documentSymbol`), so no treesitter parsers are needed.
+
+`<leader>at` asks about the whole enclosing type, found the same way. Which symbol kinds count: class, struct,
+enum, interface (a Rust trait) and object (a Rust impl block). Code over 100 KB is not sent; the plugin says so
+and you ask about a smaller part.
 
 Dockerfiles have no functions, and Docker's language server reports every instruction as one, so there
 the unit is the build stage: a `FROM` line down to the next one, named by its `AS` alias. This is found
@@ -45,6 +50,7 @@ Anything else: put the plugin on your runtimepath and call `require("askfn").set
 | normal | `<leader>aq` | ask about the function under the cursor |
 | visual | `<leader>aq` | ask about the selection |
 | normal / visual | `<leader>aQ` | as `<leader>aq`, and send the whole file as context |
+| normal | `<leader>at` | ask about the class, struct, enum, trait or impl block around the cursor |
 | visual / operator | `af` | the whole function including its signature |
 | answer window | `<CR>` | ask a follow-up question |
 | answer window | `o` | continue in an interactive agent terminal |
@@ -77,6 +83,7 @@ require("askfn").setup({
   keys = { -- any of them: false to disable
     ask = "<leader>aq",
     ask_file = "<leader>aQ",
+    ask_type = "<leader>at",
     textobject = "af",
     follow_up = "<CR>",
     handoff = "o",

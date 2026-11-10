@@ -14,11 +14,13 @@ local M = {}
 ---@field path string file path shown to the agent
 ---@field filetype string
 ---@field target askfn.Target
+---@field noun string? what a named target is ("function", "type"); defaults to a function
 ---@field code string[] lines of the target
 ---@field file string[]? every line of the file, when the whole file is sent as context
 ---@field question string
 
 local MIN_FENCE = 3
+local DEFAULT_NOUN = "function"
 
 ---Code block whose fence is longer than any backtick run inside, so the content cannot close it.
 ---@param filetype string
@@ -37,7 +39,8 @@ function M.prompt(input)
   local target = input.target
   local header = ("File: %s:%d-%d"):format(input.path, target.start_line, target.end_line)
   if target.name then
-    header = ("%s\nFunction: %s"):format(header, target.name)
+    local noun = input.noun or DEFAULT_NOUN
+    header = ("%s\n%s: %s"):format(header, (noun:gsub("^%l", string.upper)), target.name)
   end
   local sections = { header, code_block(input.filetype, input.code) }
   if input.file then

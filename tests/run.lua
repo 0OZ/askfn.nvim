@@ -89,6 +89,34 @@ test("flat symbol list picks the innermost function in either order", function()
   eq(inner, symbol.innermost_callable({ flat("inner", 3, 5), flat("outer", 0, 9) }, 5), "inner listed first")
 end)
 
+local CALC = sym("Calc", SymbolKind.Class, 0, 9, { sym("sum", SymbolKind.Method, 2, 4) })
+
+test("type scope returns the class around a method, not the method", function()
+  eq({ name = "Calc", start_line = 1, end_line = 10 }, symbol.innermost({ CALC }, 4, symbol.TYPE), "cursor in a method")
+end)
+
+test("type scope picks the inner of two nested types", function()
+  local outer = sym("Outer", SymbolKind.Class, 0, 9, { sym("Inner", SymbolKind.Class, 3, 6) })
+  eq({ name = "Inner", start_line = 4, end_line = 7 }, symbol.innermost({ outer }, 5, symbol.TYPE), "inner type")
+end)
+
+test("type scope ignores a plain function", function()
+  eq(nil, symbol.innermost({ ADD }, 4, symbol.TYPE), "a function is not a type")
+end)
+
+local TYPE_KINDS = {
+  { name = "struct", kind = SymbolKind.Struct },
+  { name = "enum", kind = SymbolKind.Enum },
+  { name = "interface, which is a Rust trait", kind = SymbolKind.Interface },
+  { name = "object, which is a Rust impl block", kind = SymbolKind.Object },
+}
+for _, case in ipairs(TYPE_KINDS) do
+  test("type scope counts a " .. case.name, function()
+    local found = symbol.innermost({ sym("T", case.kind, 0, 2) }, 2, symbol.TYPE)
+    eq({ name = "T", start_line = 1, end_line = 3 }, found, case.name)
+  end)
+end
+
 -- ── request: prompt and argv ────────────────────────────────────────────────
 
 -- ── docker: build stage lookup ──────────────────────────────────────────────
@@ -396,6 +424,13 @@ local function open_source(symbols)
   close_floats()
   vim.cmd.stopinsert()
   vim.cmd("silent! %bwipeout!")
+  -- vim.lsp.start reuses a client of the same name, which would keep answering with old symbols.
+  for _, client in ipairs(vim.lsp.get_clients()) do
+    client:stop(true)
+  end
+  vim.wait(WAIT_MS, function()
+    return #vim.lsp.get_clients() == 0
+  end)
   notifications = {}
   vim.fn.setreg('"', "")
   vim.api.nvim_buf_set_name(0, vim.fn.getcwd() .. "/math.lua")
@@ -497,6 +532,55 @@ test("asking in a Dockerfile works without a language server and sends the stage
   lacks(answer, "ENTRYPOINT", "the next stage is not included")
 end)
 
+test("blank line between Dockerfile stages says the cursor is outside, and opens no popup", function()
+  use_agent(ECHO_PROMPT)
+  open_dockerfile(nil)
+  feed("4G<leader>aq")
+  eq(1, #vim.api.nvim_list_wins(), "no popup")
+  contains(notifications[1].message, "not inside a function", "names the real cause")
+end)
+
+local CALC_CLASS = sym("Calc", SymbolKind.Class, 0, 6, { sym("add", SymbolKind.Method, 2, 4) })
+
+test("the type key asks about the class around the cursor, with the whole class as the code", function()
+  use_agent(ECHO_PROMPT)
+  open_source({ CALC_CLASS })
+  feed("4G<leader>at")
+  submit("why?")
+  local answer = wait_for_buffer_text("Question: why?")
+  contains(answer, "File: math.lua:1-7", "the class range, not the method's")
+  contains(answer, "Type: Calc", "labelled as a type")
+  contains(answer, "return add", "a line inside the class but outside the method")
+  lacks(answer, "Full file, for context", "the type key does not also send the whole file")
+end)
+
+test("the type key in a Dockerfile does not treat a build stage as a type", function()
+  use_agent(ECHO_PROMPT)
+  open_dockerfile({ sym("WORKDIR", SymbolKind.Function, 1, 1) })
+  feed("2G<leader>at")
+  eq(1, #vim.api.nvim_list_wins(), "no popup")
+  contains(notifications[1].message, "not inside a type", "a stage is not a class, struct or enum")
+end)
+
+test("the type key outside any class says so and opens no popup", function()
+  use_agent(ECHO_PROMPT)
+  open_source({ ADD })
+  feed("4G<leader>at")
+  eq(1, #vim.api.nvim_list_wins(), "no popup")
+  contains(notifications[1].message, "not inside a type", "names what the key looks for")
+end)
+
+test("a target over the size cap is refused with a warning and opens no popup", function()
+  use_agent(ECHO_PROMPT)
+  open_source({ sym("Big", SymbolKind.Class, 0, 3006) })
+  local filler = vim.fn["repeat"]({ "-- filler line that makes the class big enough to pass the cap" }, 3000)
+  vim.api.nvim_buf_set_lines(0, -1, -1, false, filler)
+  feed("4G<leader>at")
+  eq(1, #vim.api.nvim_list_wins(), "no popup")
+  contains(notifications[1].message, "too large", "the user is told why")
+  eq(vim.log.levels.WARN, notifications[1].level, "a refusal is a warning")
+end)
+
 test("the whole-file ask key sends the lines outside the function too", function()
   use_agent(ECHO_PROMPT)
   open_source({ ADD })
@@ -534,6 +618,20 @@ test("a file over the size cap is left out, with a notice, and the question stil
   local answer = wait_for_buffer_text("Question: why?")
   lacks(answer, "filler line", "file left out")
   contains(answer, "local function add(a, b)", "function still sent")
+  contains(notifications[1].message, "too large", "the user is told why")
+  eq(vim.log.levels.INFO, notifications[1].level, "informational, not an error")
+end)
+
+test("a file that fits alone but not together with a large function is left out, with a notice", function()
+  use_agent(ECHO_PROMPT)
+  open_source({ sym("big", SymbolKind.Function, 0, 999) })
+  -- 60 bytes a line: the function is 1000 lines (60 KB), the file 1100 (66 KB), together over the cap.
+  local line = ("x"):rep(59)
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, vim.fn["repeat"]({ line }, 1100))
+  feed("500G<leader>aQ")
+  submit("why?")
+  local answer = wait_for_buffer_text("Question: why?")
+  lacks(answer, "Full file, for context", "file left out")
   contains(notifications[1].message, "too large", "the user is told why")
   eq(vim.log.levels.INFO, notifications[1].level, "informational, not an error")
 end)
@@ -603,6 +701,30 @@ test("no language server warns instead of opening a popup", function()
   feed("4G<leader>aq")
   eq(1, #vim.api.nvim_list_wins(), "no popup")
   eq(vim.log.levels.WARN, notifications[1].level, "warning shown")
+end)
+
+test("no language server says so", function()
+  use_agent(ECHO_PROMPT)
+  open_source(nil)
+  feed("4G<leader>aq")
+  contains(notifications[1].message, "no language server", "names the missing server")
+end)
+
+test("cursor outside any function says so, not that a server is missing", function()
+  use_agent(ECHO_PROMPT)
+  open_source({ ADD })
+  feed("1G<leader>aq")
+  eq(1, #vim.api.nvim_list_wins(), "no popup")
+  contains(notifications[1].message, "not inside a function", "names the real cause")
+  lacks(notifications[1].message, "no language server", "does not blame the server")
+end)
+
+test("server that answers without symbols says it is not ready", function()
+  use_agent(ECHO_PROMPT)
+  open_source(vim.NIL)
+  feed("4G<leader>aq")
+  contains(notifications[1].message, "not answered", "tells the user to retry")
+  lacks(notifications[1].message, "not inside a function", "does not claim the cursor is wrong")
 end)
 
 test("missing agent binary reports an error instead of opening a popup", function()
