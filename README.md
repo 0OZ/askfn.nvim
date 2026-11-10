@@ -48,6 +48,8 @@ Anything else: put the plugin on your runtimepath and call `require("askfn").set
 
 Follow-up and terminal handoff wait until the current answer is complete.
 
+With the Claude backend the terminal session starts in plan mode, because the question ran in it; Shift+Tab leaves it.
+
 ## Configuration
 
 Defaults:
@@ -58,7 +60,7 @@ require("askfn").setup({
   backends = {
     claude = {
       cmd = {
-        "claude", "-p", "--model", "claude-sonnet-5-5", "--effort", "xhigh",
+        "claude", "-p", "--model", "claude-sonnet-5-5", "--effort", "xhigh", "--permission-mode", "plan",
         "--output-format", "stream-json", "--verbose", "--include-partial-messages",
       },
       output = "claude-stream-json",
@@ -97,6 +99,9 @@ A backend is a table:
 - `session` (optional): lets the plugin continue a conversation. Each first question runs under a fresh
   session id passed after `start`; follow-ups pass the same id after `resume`; `interactive` plus the id
   reopens the session in a terminal. Without `session` there is no follow-up and no handoff (pi, for now).
+
+The Claude backend runs in plan mode (`--permission-mode plan`), so a question can read your code but never
+edits it, whatever your own Claude settings say. Drop those two arguments from `cmd` if you want it to act.
 
 Switch to pi with `backend = "pi"`.
 

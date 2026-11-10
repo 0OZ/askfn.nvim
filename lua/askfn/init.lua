@@ -37,6 +37,8 @@ local defaults = {
         "claude-sonnet-5-5",
         "--effort",
         "xhigh",
+        "--permission-mode",
+        "plan",
         "--output-format",
         "stream-json",
         "--verbose",
