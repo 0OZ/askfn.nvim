@@ -91,6 +91,51 @@ end)
 
 -- ── request: prompt and argv ────────────────────────────────────────────────
 
+-- ── docker: build stage lookup ──────────────────────────────────────────────
+
+local docker = require("askfn.docker")
+local DOCKERFILE = {
+  "FROM golang:1.26 AS build",
+  "WORKDIR /src",
+  "RUN go build -o /out/app ./cmd",
+  "",
+  "FROM alpine:3.20",
+  "COPY --from=build /out/app /app",
+  'ENTRYPOINT ["/app"]',
+  "",
+}
+local BUILD_STAGE = { name = "build", start_line = 1, end_line = 3 }
+
+test("line inside a build stage finds the stage named by its alias", function()
+  eq(BUILD_STAGE, docker.stage_at(DOCKERFILE, 2), "WORKDIR belongs to build")
+end)
+
+test("FROM line and last instruction both belong to their stage", function()
+  eq(BUILD_STAGE, docker.stage_at(DOCKERFILE, 1), "FROM line")
+  eq(BUILD_STAGE, docker.stage_at(DOCKERFILE, 3), "last instruction")
+end)
+
+test("stage without alias is named by its image and ends at the last instruction", function()
+  eq({ name = "alpine:3.20", start_line = 5, end_line = 7 }, docker.stage_at(DOCKERFILE, 6), "trailing blank line trimmed")
+end)
+
+test("blank line between stages belongs to neither", function()
+  eq(nil, docker.stage_at(DOCKERFILE, 4), "gap")
+end)
+
+test("lowercase from and as are recognised", function()
+  eq({ name = "web", start_line = 1, end_line = 2 }, docker.stage_at({ "from node:22 as web", "run npm ci" }, 2), "case-insensitive")
+end)
+
+test("FROM flags are not mistaken for the image", function()
+  local lines = { "FROM --platform=$BUILDPLATFORM golang:1.26", "RUN go build" }
+  eq({ name = "golang:1.26", start_line = 1, end_line = 2 }, docker.stage_at(lines, 2), "flag skipped")
+end)
+
+test("line before the first FROM belongs to no stage", function()
+  eq(nil, docker.stage_at({ "ARG VERSION=1", "FROM alpine" }, 1), "global ARG")
+end)
+
 local request = require("askfn.request")
 local SESSION = { start = "--sid", resume = "--continue-sid", interactive = { "agent", "--resume" } }
 
@@ -388,6 +433,32 @@ test("af from linewise visual mode selects the whole function", function()
   open_source({ ADD })
   feed("4GVafy")
   eq("local function add(a, b)\n  return a + b\nend\n", vim.fn.getreg('"'), "selection grows to the function")
+end)
+
+-- Docker's language server reports every instruction as a one-line "function".
+local function open_dockerfile(symbols)
+  open_source(symbols)
+  vim.api.nvim_buf_set_name(0, vim.fn.getcwd() .. "/Dockerfile")
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, DOCKERFILE)
+  vim.bo.filetype = "dockerfile"
+end
+
+test("yaf in a Dockerfile selects the whole build stage, not one instruction", function()
+  use_agent(ECHO_PROMPT)
+  open_dockerfile({ sym("WORKDIR", SymbolKind.Function, 1, 1) })
+  feed("2Gyaf")
+  eq("FROM golang:1.26 AS build\nWORKDIR /src\nRUN go build -o /out/app ./cmd\n", vim.fn.getreg('"'), "stage, not WORKDIR")
+end)
+
+test("asking in a Dockerfile works without a language server and sends the stage", function()
+  use_agent(ECHO_PROMPT)
+  open_dockerfile(nil)
+  feed("2G<leader>aq")
+  submit("why this base image?")
+  local answer = wait_for_buffer_text("Question: why this base image?")
+  contains(answer, "Dockerfile:1-3", "prompt names the stage range")
+  contains(answer, "RUN go build -o /out/app ./cmd", "stage source reached the agent")
+  lacks(answer, "ENTRYPOINT", "the next stage is not included")
 end)
 
 test("asking sends function and question to the agent and shows its answer", function()

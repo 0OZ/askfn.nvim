@@ -14,6 +14,10 @@ Ask a coding agent about the function under your cursor, without leaving the buf
 No dependencies. Function boundaries come from the attached language server
 (`textDocument/documentSymbol`), so no treesitter parsers are needed.
 
+Dockerfiles have no functions, and Docker's language server reports every instruction as one, so there
+the unit is the build stage: a `FROM` line down to the next one, named by its `AS` alias. This is found
+by reading the text and needs no language server.
+
 ## Requirements
 
 - Neovim 0.11+

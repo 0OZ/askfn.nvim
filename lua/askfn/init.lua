@@ -1,4 +1,5 @@
 local conversation = require("askfn.conversation")
+local docker = require("askfn.docker")
 local input = require("askfn.input")
 local request = require("askfn.request")
 local stream = require("askfn.stream")
@@ -11,6 +12,10 @@ local SYMBOL_TIMEOUT_MS = 1000
 local ESC = "\27"
 local NAMESPACE = vim.api.nvim_create_namespace("askfn")
 local TARGET_HIGHLIGHT = "AskfnTarget"
+
+---Filetypes whose language server has no useful function symbols; the unit is found in the text.
+---@type table<string, fun(lines: string[], cursor_line: integer): askfn.Target?>
+local TEXT_SCOPES = { dockerfile = docker.stage_at }
 
 ---@class askfn.Keys
 ---@field ask string|false normal: ask about the function under the cursor; visual: about the selection
@@ -69,9 +74,13 @@ local config = defaults
 
 ---@return askfn.Target?
 local function function_at_cursor()
+  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+  local text_scope = TEXT_SCOPES[vim.bo.filetype]
+  if text_scope then
+    return text_scope(vim.api.nvim_buf_get_lines(0, 0, -1, false), cursor_line)
+  end
   local params = { textDocument = vim.lsp.util.make_text_document_params() }
   local responses = vim.lsp.buf_request_sync(0, DOCUMENT_SYMBOL, params, SYMBOL_TIMEOUT_MS)
-  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
   for _, response in pairs(responses or {}) do
     local found = type(response.result) == "table" and symbol.innermost_callable(response.result, cursor_line)
     if found then
