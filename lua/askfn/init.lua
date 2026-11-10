@@ -1,35 +1,61 @@
+local conversation = require("askfn.conversation")
+local input = require("askfn.input")
 local request = require("askfn.request")
+local stream = require("askfn.stream")
 local symbol = require("askfn.symbol")
-local ui = require("askfn.ui")
 
 local M = {}
 
 local DOCUMENT_SYMBOL = "textDocument/documentSymbol"
 local SYMBOL_TIMEOUT_MS = 1000
 local ESC = "\27"
-local FOOTER_CLOSE = " q close "
-local FOOTER_HANDOFF = " q close · %s continue in terminal "
+local NAMESPACE = vim.api.nvim_create_namespace("askfn")
+local TARGET_HIGHLIGHT = "AskfnTarget"
 
 ---@class askfn.Keys
 ---@field ask string|false normal: ask about the function under the cursor; visual: about the selection
 ---@field textobject string|false visual/operator-pending: the whole function including its signature
----@field handoff string|false inside the answer window: continue the conversation interactively
+---@field follow_up string|false answer window: ask another question in the same session
+---@field handoff string|false answer window: continue the conversation interactively
+---@field yank string|false answer window: copy the last answer
+---@field yank_code string|false answer window: copy the first code block of the last answer
 
 ---@class askfn.Config
 ---@field backend string key into `backends`
 ---@field backends table<string, askfn.Backend>
 ---@field keys askfn.Keys
+---@field animate boolean grow the answer window smoothly
 ---@field handoff fun(argv: string[]) opens the interactive agent; `argv` resumes the asked session
 local defaults = {
   backend = "claude",
   backends = {
     claude = {
-      cmd = { "claude", "-p", "--model", "claude-sonnet-5-5", "--effort", "xhigh" },
-      session = { flag = "--session-id", resume = { "claude", "--resume" } },
+      cmd = {
+        "claude",
+        "-p",
+        "--model",
+        "claude-sonnet-5-5",
+        "--effort",
+        "xhigh",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+      },
+      output = "claude-stream-json",
+      session = { start = "--session-id", resume = "--resume", interactive = { "claude", "--resume" } },
     },
-    pi = { cmd = { "pi", "-p", "--thinking", "xhigh" } },
+    pi = { cmd = { "pi", "-p", "--thinking", "xhigh" }, output = "text" },
   },
-  keys = { ask = "<leader>aq", textobject = "af", handoff = "o" },
+  keys = {
+    ask = "<leader>aq",
+    textobject = "af",
+    follow_up = "<CR>",
+    handoff = "o",
+    yank = "gy",
+    yank_code = "gY",
+  },
+  animate = true,
   handoff = function(argv)
     vim.cmd("botright vnew")
     vim.fn.jobstart(argv, { term = true })
@@ -72,41 +98,22 @@ local function select_function()
   vim.cmd.normal({ ("%dGV%dG"):format(target.start_line, target.end_line), bang = true })
 end
 
----Runs the agent on `prompt` and shows its answer in a float.
----@param backend askfn.Backend
----@param title string
----@param prompt string
-local function answer(backend, title, prompt)
-  local session = backend.session
-  local handoff_key = session and config.keys.handoff
-  local session_id = session and request.session_id()
-  local footer = handoff_key and FOOTER_HANDOFF:format(handoff_key) or FOOTER_CLOSE
-  local view = ui.answer(title, { ("Asking %s…"):format(config.backend) }, footer)
-
-  local answered = false
-  local job = vim.system(
-    request.argv(backend, prompt, session_id),
-    { text = true },
-    vim.schedule_wrap(function(result)
-      answered = true
-      view.set(request.answer_lines(result))
-    end)
-  )
-  view.on_close(function()
-    if not job:is_closing() then
-      job:kill("sigterm")
+---Marks the lines being asked about.
+---@param bufnr integer
+---@param target askfn.Target
+---@return fun() clear removes the mark again
+local function highlight(bufnr, target)
+  local last_line = vim.api.nvim_buf_get_lines(bufnr, target.end_line - 1, target.end_line, false)[1]
+  local mark = vim.api.nvim_buf_set_extmark(bufnr, NAMESPACE, target.start_line - 1, 0, {
+    end_row = target.end_line - 1,
+    end_col = #last_line,
+    hl_group = TARGET_HIGHLIGHT,
+    hl_eol = true,
+  })
+  return function()
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      vim.api.nvim_buf_del_extmark(bufnr, NAMESPACE, mark)
     end
-  end)
-
-  if handoff_key then
-    view.map(handoff_key, function()
-      if not answered then
-        vim.notify("askfn: still answering, the session can be continued once the answer is in", vim.log.levels.WARN)
-        return
-      end
-      view.close()
-      config.handoff(request.resume_argv(session, session_id))
-    end)
   end
 end
 
@@ -116,35 +123,55 @@ local function ask(target)
     vim.notify("askfn: no function under the cursor (is a language server attached?)", vim.log.levels.WARN)
     return
   end
-  local backend = config.backends[config.backend]
-  if vim.fn.executable(backend.cmd[1]) ~= 1 then
-    vim.notify(("askfn: %q is not executable"):format(backend.cmd[1]), vim.log.levels.ERROR)
+  local executable = config.backends[config.backend].cmd[1]
+  if vim.fn.executable(executable) ~= 1 then
+    vim.notify(("askfn: %q is not executable"):format(executable), vim.log.levels.ERROR)
     return
   end
 
   local bufnr = vim.api.nvim_get_current_buf()
   local code = vim.api.nvim_buf_get_lines(bufnr, target.start_line - 1, target.end_line, false)
-  local title = (" %s · %s "):format(config.backend, target.name or "selection")
+  local label = ("%s · %s"):format(config.backend, target.name or "selection")
+  local clear_highlight = highlight(bufnr, target)
 
-  ui.input(title, function(question)
-    local prompt = request.prompt({
-      path = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(bufnr), ":."),
-      filetype = vim.bo[bufnr].filetype,
-      target = target,
-      code = code,
-      question = question,
-    })
-    answer(backend, title, prompt)
-  end)
+  input.open((" %s "):format(label), {
+    on_cancel = clear_highlight,
+    on_submit = function(question)
+      conversation.start({
+        config = config,
+        label = label,
+        question = question,
+        prompt = request.prompt({
+          path = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(bufnr), ":."),
+          filetype = vim.bo[bufnr].filetype,
+          target = target,
+          code = code,
+          question = question,
+        }),
+        on_close = clear_highlight,
+      })
+    end,
+  })
+end
+
+---@param merged askfn.Config
+local function validate(merged)
+  if not merged.backends[merged.backend] then
+    error(("askfn: unknown backend %q"):format(merged.backend))
+  end
+  for name, backend in pairs(merged.backends) do
+    if not stream.is_format(backend.output) then
+      error(("askfn: backend %q has unknown output format %q"):format(name, tostring(backend.output)))
+    end
+  end
 end
 
 ---@param opts askfn.Config? partial config, merged over the defaults
 function M.setup(opts)
   local merged = vim.tbl_deep_extend("force", defaults, opts or {})
-  if not merged.backends[merged.backend] then
-    error(("askfn: unknown backend %q"):format(merged.backend))
-  end
+  validate(merged)
   config = merged
+  vim.api.nvim_set_hl(0, TARGET_HIGHLIGHT, { default = true, link = "CursorLine" })
 
   local keys = merged.keys
   if keys.ask then

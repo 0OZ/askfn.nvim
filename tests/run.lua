@@ -4,6 +4,7 @@ vim.g.mapleader = " "
 
 local SymbolKind = vim.lsp.protocol.SymbolKind
 local WAIT_MS = 2000
+local POLL_MS = 2
 
 local tests = {}
 local function test(name, fn)
@@ -19,6 +20,12 @@ end
 local function contains(haystack, needle, message)
   if not haystack:find(needle, 1, true) then
     error(("%s\n  missing: %s\n  in: %s"):format(message, needle, haystack), 2)
+  end
+end
+
+local function lacks(haystack, needle, message)
+  if haystack:find(needle, 1, true) then
+    error(("%s\n  unexpected: %s\n  in: %s"):format(message, needle, haystack), 2)
   end
 end
 
@@ -85,6 +92,7 @@ end)
 -- ── request: prompt and argv ────────────────────────────────────────────────
 
 local request = require("askfn.request")
+local SESSION = { start = "--sid", resume = "--continue-sid", interactive = { "agent", "--resume" } }
 
 test("prompt names file, line range and function", function()
   local prompt = request.prompt({
@@ -108,18 +116,28 @@ test("prompt for a plain selection has no function line", function()
     code = { "x = 1" },
     question = "why?",
   })
-  eq(nil, prompt:find("Function:", 1, true), "selection has no name")
+  lacks(prompt, "Function:", "selection has no name")
 end)
 
-test("argv names the session before the prompt when the backend supports sessions", function()
-  local backend = { cmd = { "agent" }, session = { flag = "--sid", resume = { "agent", "--resume" } } }
-  eq({ "agent", "--sid", "abc", "hello" }, request.argv(backend, "hello", "abc"), "session flag then prompt")
+test("first argv appends the prompt and leaves the backend command untouched", function()
+  local backend = { cmd = { "agent", "-p" } }
+  eq({ "agent", "-p", "hello" }, request.first_argv(backend, "hello"), "prompt is the last argument")
+  eq({ "agent", "-p" }, backend.cmd, "configured command must not grow between asks")
 end)
 
-test("resume argv appends the session id and leaves the configured command untouched", function()
-  local session = { flag = "--sid", resume = { "agent", "--resume" } }
-  eq({ "agent", "--resume", "abc" }, request.resume_argv(session, "abc"), "id is the last argument")
-  eq({ "agent", "--resume" }, session.resume, "configured command must not grow between asks")
+test("first argv starts the session before the prompt", function()
+  local backend = { cmd = { "agent" }, session = SESSION }
+  eq({ "agent", "--sid", "abc", "hello" }, request.first_argv(backend, "hello", "abc"), "start flag, id, prompt")
+end)
+
+test("follow-up argv resumes the session with only the new question", function()
+  local backend = { cmd = { "agent" }, session = SESSION }
+  eq({ "agent", "--continue-sid", "abc", "more?" }, request.follow_up_argv(backend, "more?", "abc"), "resume flag")
+end)
+
+test("interactive argv appends the session id and leaves the configured command untouched", function()
+  eq({ "agent", "--resume", "abc" }, request.interactive_argv(SESSION, "abc"), "id is the last argument")
+  eq({ "agent", "--resume" }, SESSION.interactive, "configured command must not grow between asks")
 end)
 
 test("session ids are distinct version-4 UUIDs", function()
@@ -129,17 +147,130 @@ test("session ids are distinct version-4 UUIDs", function()
   eq(true, first ~= second, "two asks must not share a session")
 end)
 
-test("argv appends the prompt and leaves the backend command untouched", function()
-  local backend = { cmd = { "agent", "-p" } }
-  eq({ "agent", "-p", "hello" }, request.argv(backend, "hello"), "prompt is the last argument")
-  eq({ "agent", "-p" }, backend.cmd, "configured command must not grow between asks")
+-- ── stream: agent output → answer text ──────────────────────────────────────
+
+local stream = require("askfn.stream")
+
+local function delta(text, parent)
+  local event = { type = "content_block_delta", delta = { type = "text_delta", text = text } }
+  return vim.json.encode({ type = "stream_event", event = event, parent_tool_use_id = parent }) .. "\n"
+end
+
+local function block_start(kind)
+  local event = { type = "content_block_start", content_block = { type = kind } }
+  return vim.json.encode({ type = "stream_event", event = event }) .. "\n"
+end
+
+local function result(text)
+  return vim.json.encode({ type = "result", is_error = false, result = text }) .. "\n"
+end
+
+test("plain text output passes through unchanged", function()
+  local decode = stream.decoder("text")
+  eq("Hello wor", decode("Hello wor"), "first chunk")
+  eq("ld\n", decode("ld\n"), "second chunk")
+end)
+
+test("claude text deltas become answer text", function()
+  local decode = stream.decoder("claude-stream-json")
+  eq("Hello world", decode(delta("Hello") .. delta(" world")), "deltas in order")
+end)
+
+test("claude event split across chunks is decoded once complete", function()
+  local decode = stream.decoder("claude-stream-json")
+  local line = delta("Hello")
+  eq("", decode(line:sub(1, 20)), "half a line is not text yet")
+  eq("Hello", decode(line:sub(21)), "completed line")
+end)
+
+test("claude thinking, tool and system events are not answer text", function()
+  local decode = stream.decoder("claude-stream-json")
+  local thinking = { type = "content_block_delta", delta = { type = "thinking_delta", thinking = "hmm" } }
+  local tool_input = { type = "content_block_delta", delta = { type = "input_json_delta", partial_json = "{" } }
+  local noise = vim.json.encode({ type = "system", subtype = "init" })
+    .. "\n"
+    .. vim.json.encode({ type = "stream_event", event = thinking })
+    .. "\n"
+    .. vim.json.encode({ type = "stream_event", event = tool_input })
+    .. "\n"
+    .. vim.json.encode({ type = "assistant", message = { content = { { type = "text", text = "dup" } } } })
+    .. "\n"
+  eq("", decode(noise), "only text deltas count")
+end)
+
+test("claude malformed and wrong-shaped lines are skipped without losing later text", function()
+  local decode = stream.decoder("claude-stream-json")
+  eq("ok", decode('not json\n{"type":"stream_event"}\n' .. delta("ok")), "bad lines dropped")
+end)
+
+test("claude text after a tool call starts a new paragraph", function()
+  local decode = stream.decoder("claude-stream-json")
+  local output = block_start("text") .. delta("Reading.") .. block_start("tool_use") .. block_start("text") .. delta("Done.")
+  eq("Reading.\n\nDone.", decode(output), "blank line between text blocks")
+end)
+
+test("claude subagent text is not answer text", function()
+  local decode = stream.decoder("claude-stream-json")
+  eq("main", decode(delta("sub", "toolu_1") .. delta("main")), "only the top-level agent speaks")
+end)
+
+test("claude result text is used when nothing was streamed", function()
+  local decode = stream.decoder("claude-stream-json")
+  eq("Credit balance is too low", decode(result("Credit balance is too low")), "error result")
+end)
+
+test("claude thinking before a failure does not hide the result text", function()
+  local decode = stream.decoder("claude-stream-json")
+  local thinking = { type = "content_block_delta", delta = { type = "thinking_delta", thinking = "hmm" } }
+  local output = vim.json.encode({ type = "stream_event", event = thinking }) .. "\n" .. result("Rate limited")
+  eq("Rate limited", decode(output), "thinking is not answer text, so the result still counts")
+end)
+
+test("claude result text is not repeated after streaming", function()
+  local decode = stream.decoder("claude-stream-json")
+  eq("Hi", decode(delta("Hi") .. result("Hi")), "answer shown once")
+end)
+
+-- ── thread: turns → float content ───────────────────────────────────────────
+
+local thread = require("askfn.thread")
+
+test("turn renders the quoted question above its answer", function()
+  local lines = thread.render({ { question = "why?", answer = "Because.\nReally." } })
+  eq({ "> why?", "", "Because.", "Really." }, lines, "question, blank, answer")
+end)
+
+test("turn without an answer yet renders only the question", function()
+  eq({ "> why?" }, (thread.render({ { question = "why?", answer = "" } })), "pending turn")
+end)
+
+test("turns are separated and the last question line is reported", function()
+  local turns = { { question = "why?", answer = "Because." }, { question = "and?", answer = "" } }
+  local lines, last_question_line = thread.render(turns)
+  eq({ "> why?", "", "Because.", "", "> and?" }, lines, "two turns")
+  eq(5, last_question_line, "line of the newest question")
+end)
+
+test("first code block is extracted without its fence", function()
+  local answer = "Use:\n```lua\nlocal x = 1\nreturn x\n```\nor\n```lua\nlocal y = 2\n```"
+  eq("local x = 1\nreturn x", thread.first_code_block(answer), "first of two blocks")
+end)
+
+test("answer without a code block has none", function()
+  eq(nil, thread.first_code_block("Just prose."), "no fence")
 end)
 
 -- ── plugin: keymaps against a fake language server and a fake agent ─────────
 
 local askfn = require("askfn")
 local SOURCE = { "local x = 1", "", "local function add(a, b)", "  return a + b", "end", "", "return add" }
-local ECHO_PROMPT = { cmd = { "sh", "-c", 'printf "%s" "$0"' } }
+local ECHO_PROMPT = { cmd = { "sh", "-c", 'printf "%s" "$0"' }, output = "text" }
+local ECHO_ARGS_WITH_SESSION = { cmd = { "sh", "-c", 'printf "%s\\n" "$@"', "sh" }, output = "text", session = SESSION }
+local SLOW_WITH_SESSION = { cmd = { "sh", "-c", "sleep 1" }, output = "text", session = SESSION }
+
+local function says(text)
+  return { cmd = { "sh", "-c", ("printf '%s'"):format(text) }, output = "text" }
+end
 
 local notifications = {}
 vim.notify = function(message, level)
@@ -182,6 +313,7 @@ end
 ---@param symbols table? document symbols served by a fake language server; nil = no server
 local function open_source(symbols)
   close_floats()
+  vim.cmd.stopinsert()
   vim.cmd("silent! %bwipeout!")
   notifications = {}
   vim.fn.setreg('"', "")
@@ -197,29 +329,51 @@ local function open_source(symbols)
 end
 
 local handed_off = {}
-local function use_agent(backend)
+---@param backend table
+---@param animate boolean? defaults to off so heights are final as soon as text is rendered
+local function use_agent(backend, animate)
   handed_off = {}
   askfn.setup({
     backend = "fake",
     backends = { fake = backend },
+    animate = animate or false,
     handoff = function(argv)
       handed_off[#handed_off + 1] = argv
     end,
   })
 end
 
-local ECHO_ARGS_WITH_SESSION = {
-  cmd = { "sh", "-c", 'printf "%s\n" "$@"', "sh" },
-  session = { flag = "--sid", resume = { "agent", "--resume" } },
-}
+local function buffer_text()
+  return table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+end
 
 local function wait_for_buffer_text(needle)
-  local text = ""
   vim.wait(WAIT_MS, function()
-    text = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
-    return text:find(needle, 1, true) ~= nil
-  end)
-  return text
+    return buffer_text():find(needle, 1, true) ~= nil
+  end, POLL_MS)
+  return buffer_text()
+end
+
+local function title_of(win)
+  local title = vim.api.nvim_win_get_config(win).title
+  return vim
+    .iter(title)
+    :map(function(chunk)
+      return chunk[1]
+    end)
+    :join("")
+end
+
+local function target_marks(bufnr)
+  local namespace = vim.api.nvim_get_namespaces().askfn
+  return vim.tbl_map(function(mark)
+    return { first_row = mark[2], last_row = mark[4].end_row }
+  end, vim.api.nvim_buf_get_extmarks(bufnr, namespace, 0, -1, { details = true }))
+end
+
+local function ask(question)
+  feed("4G<leader>aq")
+  submit(question)
 end
 
 test("yaf yanks the whole function including its signature", function()
@@ -239,8 +393,7 @@ end)
 test("asking sends function and question to the agent and shows its answer", function()
   use_agent(ECHO_PROMPT)
   open_source({ ADD })
-  feed("4G<leader>aq")
-  submit("why?")
+  ask("why?")
   local answer = wait_for_buffer_text("Question: why?")
   contains(answer, "Question: why?", "question reached the agent")
   contains(answer, "local function add(a, b)", "function reached the agent")
@@ -248,11 +401,43 @@ test("asking sends function and question to the agent and shows its answer", fun
   eq(1, #vim.api.nvim_list_wins(), "q closes the answer")
 end)
 
-test("failing agent shows its error output", function()
-  use_agent({ cmd = { "sh", "-c", "echo boom >&2; exit 3" } })
+test("answer text appears while the agent is still running", function()
+  use_agent({ cmd = { "sh", "-c", "printf one; sleep 0.6; printf two" }, output = "text" })
   open_source({ ADD })
-  feed("4G<leader>aq")
-  submit("why?")
+  ask("why?")
+  lacks(wait_for_buffer_text("one"), "onetwo", "first chunk is shown before the agent finishes")
+  contains(wait_for_buffer_text("onetwo"), "onetwo", "later chunk is appended")
+end)
+
+test("claude stream output is shown as decoded text", function()
+  local fixture = vim.fn.tempname()
+  vim.fn.writefile(vim.split(delta("Hello") .. delta(" world"), "\n", { trimempty = true }), fixture)
+  use_agent({ cmd = { "sh", "-c", "cat " .. fixture }, output = "claude-stream-json" })
+  open_source({ ADD })
+  ask("why?")
+  local answer = wait_for_buffer_text("Hello world")
+  contains(answer, "Hello world", "decoded text")
+  lacks(answer, "content_block_delta", "raw events are not shown")
+end)
+
+test("title shows activity while answering and the plain label afterwards", function()
+  use_agent({ cmd = { "sh", "-c", "sleep 0.4; printf done" }, output = "text" })
+  open_source({ ADD })
+  ask("why?")
+  local float = vim.api.nvim_get_current_win()
+  vim.wait(200)
+  local busy_title = title_of(float)
+  wait_for_buffer_text("done")
+  vim.wait(200)
+  eq(" fake · add ", title_of(float), "plain label once answered")
+  contains(busy_title, "fake · add", "label stays visible while busy")
+  eq(true, busy_title ~= " fake · add ", "busy title carries the activity indicator: " .. busy_title)
+end)
+
+test("failing agent shows its error output", function()
+  use_agent({ cmd = { "sh", "-c", "echo boom >&2; exit 3" }, output = "text" })
+  open_source({ ADD })
+  ask("why?")
   contains(wait_for_buffer_text("boom"), "boom", "stderr of the failed agent")
 end)
 
@@ -273,7 +458,7 @@ test("no language server warns instead of opening a popup", function()
 end)
 
 test("missing agent binary reports an error instead of opening a popup", function()
-  use_agent({ cmd = { "askfn-no-such-binary" } })
+  use_agent({ cmd = { "askfn-no-such-binary" }, output = "text" })
   open_source({ ADD })
   feed("4G<leader>aq")
   eq(1, #vim.api.nvim_list_wins(), "no popup")
@@ -282,10 +467,9 @@ end)
 
 test("empty question does not run the agent", function()
   local marker = vim.fn.tempname()
-  use_agent({ cmd = { "sh", "-c", "touch " .. marker } })
+  use_agent({ cmd = { "sh", "-c", "touch " .. marker }, output = "text" })
   open_source({ ADD })
-  feed("4G<leader>aq")
-  submit("")
+  ask("")
   vim.wait(300)
   eq(1, #vim.api.nvim_list_wins(), "popup closed, no answer window")
   eq(nil, vim.uv.fs_stat(marker), "agent must not have run")
@@ -293,32 +477,117 @@ end)
 
 test("closing the answer window stops the running agent", function()
   local marker = vim.fn.tempname()
-  use_agent({ cmd = { "sh", "-c", "sleep 1; touch " .. marker } })
+  use_agent({ cmd = { "sh", "-c", "sleep 1; touch " .. marker }, output = "text" })
   open_source({ ADD })
-  feed("4G<leader>aq")
-  submit("why?")
+  ask("why?")
   feed("q")
   vim.wait(1500)
   eq(nil, vim.uv.fs_stat(marker), "agent was killed before it finished")
 end)
 
+test("asked function is highlighted while the popup and the answer are open", function()
+  use_agent(ECHO_PROMPT)
+  open_source({ ADD })
+  local source = vim.api.nvim_get_current_buf()
+  feed("4G<leader>aq")
+  eq({ { first_row = 2, last_row = 4 } }, target_marks(source), "highlight while typing the question")
+  submit("why?")
+  wait_for_buffer_text("Question: why?")
+  eq({ { first_row = 2, last_row = 4 } }, target_marks(source), "highlight while reading the answer")
+  feed("q")
+  eq({}, target_marks(source), "highlight removed with the answer")
+end)
+
+test("cancelling the question removes the highlight", function()
+  use_agent(ECHO_PROMPT)
+  open_source({ ADD })
+  local source = vim.api.nvim_get_current_buf()
+  feed("4G<leader>aq")
+  feed("<Esc>")
+  eq({}, target_marks(source), "no highlight left behind")
+  eq(1, #vim.api.nvim_list_wins(), "popup closed")
+end)
+
+test("float is as tall as a short answer", function()
+  use_agent(says("a\\nb\\nc"))
+  open_source({ ADD })
+  ask("why?")
+  wait_for_buffer_text("c")
+  eq(5, vim.api.nvim_win_get_height(0), "question, blank line and three answer lines")
+end)
+
+test("float height is capped for a long answer", function()
+  use_agent({ cmd = { "sh", "-c", "seq 1 60" }, output = "text" })
+  open_source({ ADD })
+  ask("why?")
+  wait_for_buffer_text("60")
+  eq(24, vim.o.lines, "test assumes the headless default screen")
+  eq(19, vim.api.nvim_win_get_height(0), "80% of the 24 screen lines")
+end)
+
+test("animated float grows through intermediate heights to its content", function()
+  use_agent({ cmd = { "sh", "-c", "seq 1 10" }, output = "text" }, true)
+  open_source({ ADD })
+  ask("why?")
+  local float = vim.api.nvim_get_current_win()
+  local seen = {}
+  vim.wait(WAIT_MS, function()
+    seen[vim.api.nvim_win_get_height(float)] = true
+    return seen[12]
+  end, POLL_MS)
+  eq(true, seen[12], "settles at question, blank line and ten answer lines")
+  eq(true, vim.tbl_count(seen) > 2, "passes heights between 1 and 12: " .. vim.inspect(vim.tbl_keys(seen)))
+end)
+
+test("follow-up resumes the same session with only the new question", function()
+  use_agent(ECHO_ARGS_WITH_SESSION)
+  open_source({ ADD })
+  ask("why?")
+  local session_id = wait_for_buffer_text("Question: why?"):match("%-%-sid\n([^\n]+)")
+  vim.wait(200)
+  feed("<CR>")
+  submit("and then?")
+  local follow_up_argv = "--continue-sid\n" .. session_id .. "\nand then?"
+  local conversation = wait_for_buffer_text(follow_up_argv)
+  contains(conversation, follow_up_argv, "resume flag, same id, bare question")
+  contains(conversation, "> why?", "first question stays in the thread")
+  contains(conversation, "> and then?", "follow-up question joins the thread")
+end)
+
+test("follow-up key while the agent is still answering warns", function()
+  use_agent(SLOW_WITH_SESSION)
+  open_source({ ADD })
+  ask("why?")
+  feed("<CR>")
+  eq(vim.log.levels.WARN, notifications[1].level, "warning shown")
+  eq(2, #vim.api.nvim_list_wins(), "no question popup on top of the answer")
+end)
+
+test("backend without session support has no follow-up", function()
+  use_agent(ECHO_PROMPT)
+  open_source({ ADD })
+  ask("why?")
+  wait_for_buffer_text("Question: why?")
+  vim.wait(200)
+  feed("<CR>")
+  eq(2, #vim.api.nvim_list_wins(), "no question popup")
+end)
+
 test("handoff key after the answer resumes the same session and closes the float", function()
   use_agent(ECHO_ARGS_WITH_SESSION)
   open_source({ ADD })
-  feed("4G<leader>aq")
-  submit("why?")
+  ask("why?")
   local session_id = wait_for_buffer_text("Question: why?"):match("%-%-sid\n([^\n]+)")
+  vim.wait(200)
   feed("o")
-  eq({ { "agent", "--resume", session_id } }, handed_off, "resume command for the asked session")
+  eq({ { "agent", "--resume", session_id } }, handed_off, "interactive command for the asked session")
   eq(1, #vim.api.nvim_list_wins(), "answer float closed")
 end)
 
 test("handoff key while the agent is still answering warns and keeps waiting", function()
-  local slow = { cmd = { "sh", "-c", "sleep 1" }, session = ECHO_ARGS_WITH_SESSION.session }
-  use_agent(slow)
+  use_agent(SLOW_WITH_SESSION)
   open_source({ ADD })
-  feed("4G<leader>aq")
-  submit("why?")
+  ask("why?")
   feed("o")
   eq({}, handed_off, "nothing to resume yet")
   eq(vim.log.levels.WARN, notifications[1].level, "warning shown")
@@ -328,30 +597,64 @@ end)
 test("backend without session support has no handoff", function()
   use_agent(ECHO_PROMPT)
   open_source({ ADD })
-  feed("4G<leader>aq")
-  submit("why?")
+  ask("why?")
   wait_for_buffer_text("Question: why?")
+  vim.wait(200)
   feed("o")
   eq({}, handed_off, "handoff key is not mapped")
 end)
 
-test("default handoff opens the resume command in a terminal split", function()
-  local resumable = { cmd = ECHO_PROMPT.cmd, session = { flag = "--sid", resume = { "sh", "-c", "sleep 5" } } }
-  askfn.setup({ backend = "fake", backends = { fake = resumable } })
+test("default handoff opens the interactive command in a terminal split", function()
+  local session = { start = "--sid", resume = "--continue-sid", interactive = { "sh", "-c", "sleep 5" } }
+  askfn.setup({ backend = "fake", backends = { fake = { cmd = ECHO_PROMPT.cmd, output = "text", session = session } } })
   open_source({ ADD })
-  feed("4G<leader>aq")
-  submit("why?")
+  ask("why?")
   wait_for_buffer_text("Question: why?")
+  vim.wait(200)
   feed("o")
-  eq("terminal", vim.bo.buftype, "resume command runs in a terminal buffer")
+  eq("terminal", vim.bo.buftype, "interactive command runs in a terminal buffer")
   eq(2, #vim.api.nvim_list_wins(), "terminal sits in a split next to the source")
   vim.cmd("bwipeout!")
+end)
+
+test("copy key puts the last answer in the register", function()
+  use_agent(says("Use this:\\n```lua\\nlocal x = 1\\n```\\nDone."))
+  open_source({ ADD })
+  ask("why?")
+  wait_for_buffer_text("Done.")
+  feed("gy")
+  eq("Use this:\n```lua\nlocal x = 1\n```\nDone.", vim.fn.getreg('"'), "answer without the question")
+end)
+
+test("copy-code key puts the first code block in the register", function()
+  use_agent(says("Use this:\\n```lua\\nlocal x = 1\\n```\\nDone."))
+  open_source({ ADD })
+  ask("why?")
+  wait_for_buffer_text("Done.")
+  feed("gY")
+  eq("local x = 1", vim.fn.getreg('"'), "code without its fence")
+end)
+
+test("copy-code key warns when the answer has no code block", function()
+  use_agent(says("Just prose."))
+  open_source({ ADD })
+  ask("why?")
+  wait_for_buffer_text("Just prose.")
+  feed("gY")
+  eq("", vim.fn.getreg('"'), "register untouched")
+  eq(vim.log.levels.WARN, notifications[1].level, "warning shown")
 end)
 
 test("unknown backend is rejected at setup", function()
   local ok, message = pcall(askfn.setup, { backend = "nope" })
   eq(false, ok, "setup must fail")
   contains(message, "nope", "error names the backend")
+end)
+
+test("unknown output format is rejected at setup", function()
+  local ok, message = pcall(askfn.setup, { backend = "fake", backends = { fake = { cmd = { "sh" }, output = "xml" } } })
+  eq(false, ok, "setup must fail")
+  contains(message, "xml", "error names the format")
 end)
 
 -- ── runner ──────────────────────────────────────────────────────────────────
