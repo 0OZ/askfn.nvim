@@ -12,6 +12,8 @@ local SYMBOL_TIMEOUT_MS = 1000
 local ESC = "\27"
 local NAMESPACE = vim.api.nvim_create_namespace("askfn")
 local TARGET_HIGHLIGHT = "AskfnTarget"
+-- The prompt is one command-line argument and Linux refuses arguments over 128 KB.
+local MAX_FILE_BYTES = 100000
 
 ---Filetypes whose language server has no useful function symbols; the unit is found in the text.
 ---@type table<string, fun(lines: string[], cursor_line: integer): askfn.Target?>
@@ -19,6 +21,7 @@ local TEXT_SCOPES = { dockerfile = docker.stage_at }
 
 ---@class askfn.Keys
 ---@field ask string|false normal: ask about the function under the cursor; visual: about the selection
+---@field ask_file string|false like `ask`, and send the whole file along as context
 ---@field textobject string|false visual/operator-pending: the whole function including its signature
 ---@field follow_up string|false answer window: ask another question in the same session
 ---@field handoff string|false answer window: continue the conversation interactively
@@ -56,6 +59,7 @@ local defaults = {
   },
   keys = {
     ask = "<leader>aq",
+    ask_file = "<leader>aQ",
     textobject = "af",
     follow_up = "<CR>",
     handoff = "o",
@@ -128,8 +132,22 @@ local function highlight(bufnr, target)
   end
 end
 
+---The whole buffer, when it fits in one argument.
+---@param bufnr integer
+---@return string[]?
+local function file_context(bufnr)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  if #table.concat(lines, "\n") > MAX_FILE_BYTES then
+    local notice = "askfn: file is too large to send (over %d KB), sending the function only"
+    vim.notify(notice:format(MAX_FILE_BYTES / 1000), vim.log.levels.INFO)
+    return nil
+  end
+  return lines
+end
+
 ---@param target askfn.Target?
-local function ask(target)
+---@param with_file boolean send the whole file along as context
+local function ask(target, with_file)
   if not target then
     vim.notify("askfn: no function under the cursor (is a language server attached?)", vim.log.levels.WARN)
     return
@@ -142,6 +160,7 @@ local function ask(target)
 
   local bufnr = vim.api.nvim_get_current_buf()
   local code = vim.api.nvim_buf_get_lines(bufnr, target.start_line - 1, target.end_line, false)
+  local file = with_file and file_context(bufnr) or nil
   local label = ("%s · %s"):format(config.backend, target.name or "selection")
   local clear_highlight = highlight(bufnr, target)
 
@@ -157,6 +176,7 @@ local function ask(target)
           filetype = vim.bo[bufnr].filetype,
           target = target,
           code = code,
+          file = file,
           question = question,
         }),
         on_close = clear_highlight,
@@ -177,6 +197,18 @@ local function validate(merged)
   end
 end
 
+---@param key string
+---@param with_file boolean
+local function map_ask(key, with_file)
+  local suffix = with_file and " (with the whole file)" or ""
+  vim.keymap.set("n", key, function()
+    ask(function_at_cursor(), with_file)
+  end, { desc = "Ask agent about this function" .. suffix })
+  vim.keymap.set("x", key, function()
+    ask(visual_selection(), with_file)
+  end, { desc = "Ask agent about the selection" .. suffix })
+end
+
 ---@param opts askfn.Config? partial config, merged over the defaults
 function M.setup(opts)
   local merged = vim.tbl_deep_extend("force", defaults, opts or {})
@@ -186,12 +218,10 @@ function M.setup(opts)
 
   local keys = merged.keys
   if keys.ask then
-    vim.keymap.set("n", keys.ask, function()
-      ask(function_at_cursor())
-    end, { desc = "Ask agent about this function" })
-    vim.keymap.set("x", keys.ask, function()
-      ask(visual_selection())
-    end, { desc = "Ask agent about the selection" })
+    map_ask(keys.ask, false)
+  end
+  if keys.ask_file then
+    map_ask(keys.ask_file, true)
   end
   if keys.textobject then
     vim.keymap.set({ "x", "o" }, keys.textobject, select_function, { desc = "Function including signature" })

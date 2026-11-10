@@ -6,6 +6,7 @@ Ask a coding agent about the function under your cursor, without leaving the buf
 
 - `af` text object: the whole function, signature included (`vaf`, `yaf`, `daf`)
 - `<leader>aq`: popup for a question about that function; in visual mode, about the selection
+- `<leader>aQ`: the same, with the whole file sent along as context
 - The answer streams into a floating window that grows with it; the asked code stays highlighted
 - Follow-up questions in the same window, same agent session
 - One key to continue the conversation in an interactive agent terminal
@@ -43,6 +44,7 @@ Anything else: put the plugin on your runtimepath and call `require("askfn").set
 |---|---|---|
 | normal | `<leader>aq` | ask about the function under the cursor |
 | visual | `<leader>aq` | ask about the selection |
+| normal / visual | `<leader>aQ` | as `<leader>aq`, and send the whole file as context |
 | visual / operator | `af` | the whole function including its signature |
 | answer window | `<CR>` | ask a follow-up question |
 | answer window | `o` | continue in an interactive agent terminal |
@@ -74,6 +76,7 @@ require("askfn").setup({
   },
   keys = { -- any of them: false to disable
     ask = "<leader>aq",
+    ask_file = "<leader>aQ",
     textobject = "af",
     follow_up = "<CR>",
     handoff = "o",
@@ -91,6 +94,15 @@ require("askfn").setup({
 ```
 
 The asked lines are highlighted with `AskfnTarget`, linked to `Visual` by default.
+
+### Sending the whole file
+
+`<leader>aq` sends the function (or selection), its path and its line range. An agent that can read files,
+like Claude Code, can open the rest itself. `<leader>aQ` also puts the whole file in the first prompt, for
+questions about code outside the function, or for files the agent cannot read from disk (an unsaved buffer).
+It costs more tokens, so it is a separate key. Files over 100 KB are not sent (the prompt is a single
+command-line argument and Linux caps those at 128 KB); you get a notice and the function only. Follow-up
+questions reuse the session and do not resend the file.
 
 ### Backends
 

@@ -15,7 +15,21 @@ local M = {}
 ---@field filetype string
 ---@field target askfn.Target
 ---@field code string[] lines of the target
+---@field file string[]? every line of the file, when the whole file is sent as context
 ---@field question string
+
+local MIN_FENCE = 3
+
+---Code block whose fence is longer than any backtick run inside, so the content cannot close it.
+---@param filetype string
+---@param lines string[]
+---@return string
+local function code_block(filetype, lines)
+  local body = table.concat(lines, "\n")
+  local longest_run = vim.iter(body:gmatch("`+")):map(string.len):fold(MIN_FENCE - 1, math.max)
+  local fence = ("`"):rep(longest_run + 1)
+  return ("%s%s\n%s\n%s"):format(fence, filetype, body, fence)
+end
 
 ---@param input askfn.PromptInput
 ---@return string
@@ -25,8 +39,12 @@ function M.prompt(input)
   if target.name then
     header = ("%s\nFunction: %s"):format(header, target.name)
   end
-  local code = table.concat(input.code, "\n")
-  return ("%s\n\n```%s\n%s\n```\n\nQuestion: %s"):format(header, input.filetype, code, input.question)
+  local sections = { header, code_block(input.filetype, input.code) }
+  if input.file then
+    table.insert(sections, "Full file, for context:\n\n" .. code_block(input.filetype, input.file))
+  end
+  table.insert(sections, "Question: " .. input.question)
+  return table.concat(sections, "\n\n")
 end
 
 ---@param backend askfn.Backend

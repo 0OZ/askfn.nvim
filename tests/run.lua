@@ -164,6 +164,42 @@ test("prompt for a plain selection has no function line", function()
   lacks(prompt, "Function:", "selection has no name")
 end)
 
+test("prompt with the whole file lists it between the function and the question", function()
+  local prompt = request.prompt({
+    path = "lua/math.lua",
+    filetype = "lua",
+    target = ADD_TARGET,
+    code = { "local function add(a, b)", "  return a + b", "end" },
+    file = { "local x = 1", "", "local function add(a, b)", "  return a + b", "end", "", "return add" },
+    question = "why?",
+  })
+  contains(prompt, "local x = 1", "line above the function")
+  contains(prompt, "return add", "line below the function")
+  eq("Question: why?", prompt:match("[^\n]+$"), "question stays last")
+end)
+
+test("prompt without the file has no file listing", function()
+  local prompt = request.prompt({
+    path = "lua/math.lua",
+    filetype = "lua",
+    target = ADD_TARGET,
+    code = { "local function add(a, b)" },
+    question = "why?",
+  })
+  lacks(prompt, "Full file", "no file block")
+end)
+
+test("code that contains a fence is wrapped in a longer one", function()
+  local prompt = request.prompt({
+    path = "README.md",
+    filetype = "markdown",
+    target = { start_line = 1, end_line = 3 },
+    code = { "```lua", "x = 1", "```" },
+    question = "why?",
+  })
+  contains(prompt, "````markdown\n```lua\nx = 1\n```\n````", "outer fence outgrows the inner one")
+end)
+
 test("first argv appends the prompt and leaves the backend command untouched", function()
   local backend = { cmd = { "agent", "-p" } }
   eq({ "agent", "-p", "hello" }, request.first_argv(backend, "hello"), "prompt is the last argument")
@@ -459,6 +495,47 @@ test("asking in a Dockerfile works without a language server and sends the stage
   contains(answer, "Dockerfile:1-3", "prompt names the stage range")
   contains(answer, "RUN go build -o /out/app ./cmd", "stage source reached the agent")
   lacks(answer, "ENTRYPOINT", "the next stage is not included")
+end)
+
+test("the whole-file ask key sends the lines outside the function too", function()
+  use_agent(ECHO_PROMPT)
+  open_source({ ADD })
+  feed("4G<leader>aQ")
+  submit("why?")
+  local answer = wait_for_buffer_text("Question: why?")
+  contains(answer, "local x = 1", "line above the function reached the agent")
+  contains(answer, "return add", "line below the function reached the agent")
+end)
+
+test("the plain ask key keeps the rest of the file out of the prompt", function()
+  use_agent(ECHO_PROMPT)
+  open_source({ ADD })
+  ask("why?")
+  lacks(wait_for_buffer_text("Question: why?"), "local x = 1", "only the function is sent")
+end)
+
+test("the whole-file ask key works on a visual selection", function()
+  use_agent(ECHO_PROMPT)
+  open_source(nil)
+  feed("3GV4G<leader>aQ")
+  submit("why?")
+  local answer = wait_for_buffer_text("Question: why?")
+  contains(answer, "File: math.lua:3-4", "the selection is what is asked about")
+  contains(answer, "return add", "the file around it is sent")
+end)
+
+test("a file over the size cap is left out, with a notice, and the question still runs", function()
+  use_agent(ECHO_PROMPT)
+  open_source({ ADD })
+  local filler = vim.fn["repeat"]({ "-- filler line that makes the buffer big enough to pass the cap" }, 3000)
+  vim.api.nvim_buf_set_lines(0, -1, -1, false, filler)
+  feed("4G<leader>aQ")
+  submit("why?")
+  local answer = wait_for_buffer_text("Question: why?")
+  lacks(answer, "filler line", "file left out")
+  contains(answer, "local function add(a, b)", "function still sent")
+  contains(notifications[1].message, "too large", "the user is told why")
+  eq(vim.log.levels.INFO, notifications[1].level, "informational, not an error")
 end)
 
 test("asking sends function and question to the agent and shows its answer", function()
