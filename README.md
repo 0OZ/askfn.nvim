@@ -8,10 +8,11 @@ Ask a coding agent about the function under your cursor, without leaving the buf
 - `<leader>aq`: popup for a question about that function; in visual mode, about the selection
 - `<leader>aQ`: the same, with the whole file sent along as context
 - `<leader>at`: popup for a question about the class, struct, enum, trait or impl block around the cursor
+- `<leader>am` opens a picker for the harness, model, and effort used by new questions
 - The answer streams into a floating window that grows with it; the asked code stays highlighted
 - Follow-up questions in the same window, same agent session
 - One key to continue the conversation in an interactive agent terminal
-- Backends: [Claude Code](https://claude.com/claude-code) (default) or pi (experimental), or any CLI that takes a prompt as its last argument
+- Backends: [Claude Code](https://claude.com/claude-code) (default), Cursor Agent, pi (experimental), or any CLI that takes a prompt as its last argument
 
 No dependencies. Function boundaries come from the attached language server
 (`textDocument/documentSymbol`), so no treesitter parsers are needed.
@@ -51,6 +52,7 @@ Anything else: put the plugin on your runtimepath and call `require("askfn").set
 | visual | `<leader>aq` | ask about the selection |
 | normal / visual | `<leader>aQ` | as `<leader>aq`, and send the whole file as context |
 | normal | `<leader>at` | ask about the class, struct, enum, trait or impl block around the cursor |
+| normal | `<leader>am` | choose the backend for new questions |
 | visual / operator | `af` | the whole function including its signature |
 | answer window | `<CR>` | ask a follow-up question |
 | answer window | `o` | continue in an interactive agent terminal |
@@ -67,23 +69,36 @@ With the Claude backend the terminal session starts in plan mode, because the qu
 Defaults:
 
 ```lua
+local function claude_backend(model, effort, name)
+  return {
+    label = ("Claude Code · %s · %s"):format(name, effort),
+    cmd = {
+      "claude", "-p", "--model", model, "--effort", effort, "--permission-mode", "plan",
+      "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+    },
+    output = "claude-stream-json",
+    session = { start = "--session-id", resume = "--resume", interactive = { "claude", "--resume" } },
+  }
+end
+
 require("askfn").setup({
   backend = "claude",
   backends = {
-    claude = {
-      cmd = {
-        "claude", "-p", "--model", "claude-sonnet-5-5", "--effort", "xhigh", "--permission-mode", "plan",
-        "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-      },
-      output = "claude-stream-json",
-      session = { start = "--session-id", resume = "--resume", interactive = { "claude", "--resume" } },
+    claude = claude_backend("claude-sonnet-5-5", "xhigh", "Sonnet"),
+    ["claude-fast"] = claude_backend("claude-sonnet-5-5", "medium", "Sonnet"),
+    ["claude-opus"] = claude_backend("opus", "high", "Opus"),
+    ["cursor-grok"] = {
+      label = "Cursor Agent · Grok 4.7",
+      cmd = { "cursor-agent", "-p", "--mode", "ask", "--model", "grok-4.7", "--output-format", "text" },
+      output = "text",
     },
-    pi = { cmd = { "pi", "-p", "--thinking", "xhigh" }, output = "text" },
+    pi = { label = "pi · xhigh", cmd = { "pi", "-p", "--thinking", "xhigh" }, output = "text" },
   },
   keys = { -- any of them: false to disable
     ask = "<leader>aq",
     ask_file = "<leader>aQ",
     ask_type = "<leader>at",
+    select_backend = "<leader>am",
     textobject = "af",
     follow_up = "<CR>",
     handoff = "o",
@@ -115,18 +130,25 @@ questions reuse the session and do not resend the file.
 
 A backend is a table:
 
+- `label` (optional) is the name shown in the picker. It defaults to the backend key.
 - `cmd`: argv of the CLI. The prompt (file path, line range, source and your question) is appended as the last argument.
 - `output`: how the CLI writes its answer to stdout.
   - `"text"`: shown as it arrives.
   - `"claude-stream-json"`: Claude Code's `--output-format stream-json`; only the answer text is shown.
 - `session` (optional): lets the plugin continue a conversation. Each first question runs under a fresh
   session id passed after `start`; follow-ups pass the same id after `resume`; `interactive` plus the id
-  reopens the session in a terminal. Without `session` there is no follow-up and no handoff (pi, for now).
+  reopens the session in a terminal. The built-in Cursor and pi presets run one question at a time.
 
 The Claude backend runs in plan mode (`--permission-mode plan`), so a question can read your code but never
 edits it, whatever your own Claude settings say. Drop those two arguments from `cmd` if you want it to act.
 
-Switch to pi with `backend = "pi"`.
+Use `<leader>am` to choose between Sonnet at `xhigh` (`claude`), Sonnet at `medium` (`claude-fast`),
+Opus at `high` (`claude-opus`), Grok 4.7 in Cursor's read-only Ask mode (`cursor-grok`), or pi.
+The selection applies to new questions until you choose again
+or restart Neovim. Follow-ups continue with the backend that started the conversation.
+
+Set `backend = "claude-fast"` to start Neovim with medium effort, or add a named entry to `backends`
+with your own CLI arguments. Each entry appears in the picker.
 
 ### Handing off to claudecode.nvim
 
@@ -143,8 +165,8 @@ end,
 
 ## Demo
 
-`assets/demo.gif` is recorded from a script, so it looks the same every time: a real language server,
-a stand-in agent (`demo/fake-agent.sh`) that replies with fixed text. To re-record it (needs
+`assets/demo.gif` shows a Claude follow-up and switching to Cursor with Grok 4.7. It uses a real language
+server and a stand-in CLI (`demo/fake-agent.sh`) for the replies. To re-record it (needs
 [vhs](https://github.com/charmbracelet/vhs) and `lua-language-server`):
 
 ```sh

@@ -492,6 +492,108 @@ local function ask(question)
   submit(question)
 end
 
+local function pick_backend(backend, inspect)
+  local select = vim.ui.select
+  vim.ui.select = function(items, options, on_choice)
+    if inspect then
+      inspect(options.format_item)
+    end
+    on_choice(items[vim.fn.index(items, backend) + 1])
+  end
+  local ok, err = pcall(feed, "<leader>am")
+  vim.ui.select = select
+  if not ok then
+    error(err)
+  end
+end
+
+test("backend picker key can be disabled", function()
+  askfn.setup({ keys = { select_backend = false } })
+  eq("", vim.fn.maparg("<leader>am", "n"), "picker key is available to other mappings")
+end)
+
+test("backend picker shows display names and identifies the active choice", function()
+  askfn.setup({
+    backend = "regular",
+    backends = {
+      regular = { cmd = { "true" }, output = "text", label = "Everyday model" },
+      custom = ECHO_PROMPT,
+    },
+  })
+  open_source({ ADD })
+
+  local format_item
+  pick_backend("", function(format)
+    format_item = format
+  end)
+
+  assert(format_item, "picker exposes display names")
+  eq("Everyday model (active)", format_item("regular"), "configured display name identifies the selection")
+  eq("custom", format_item("custom"), "an unnamed backend uses its config key")
+end)
+
+test("Cursor preset asks Grok 4.7 in read-only print mode", function()
+  local bin = vim.fn.tempname()
+  local agent = bin .. "/cursor-agent"
+  vim.fn.mkdir(bin, "p")
+  vim.fn.writefile({ "#!/bin/sh", [[printf '%s\n' "$@"]] }, agent)
+  vim.fn.setfperm(agent, "rwx------")
+  askfn.setup({ backend = "regular", backends = { regular = ECHO_PROMPT }, animate = false })
+  open_source({ ADD })
+  local original_path = vim.env.PATH
+  vim.env.PATH = bin .. ":" .. original_path
+
+  local ok, err = pcall(function()
+    pick_backend("cursor-grok")
+    ask("why?")
+  end)
+  vim.env.PATH = original_path
+  assert(ok, err)
+
+  local answer = wait_for_buffer_text("Question: why?")
+  contains(answer, "-p\n--mode\nask\n--model\ngrok-4.7\n--output-format\ntext\n", "Cursor CLI receives the Grok Q&A options")
+end)
+
+for _, scenario in ipairs({
+  { name = "selecting another backend changes the next question", choice = "quick", answer = "quick reply" },
+  { name = "cancelling the picker keeps the current backend", choice = "", answer = "default reply" },
+}) do
+  test(scenario.name, function()
+    askfn.setup({
+      backend = "regular",
+      backends = { regular = says("default reply"), quick = says("quick reply") },
+      animate = false,
+    })
+    open_source({ ADD })
+
+    pick_backend(scenario.choice)
+    ask("why?")
+
+    contains(wait_for_buffer_text(scenario.answer), scenario.answer, "reply from the active backend")
+  end)
+end
+
+test("switching backends during a conversation keeps follow-ups with the original backend", function()
+  askfn.setup({
+    backend = "regular",
+    backends = { regular = ECHO_ARGS_WITH_SESSION, quick = says("quick reply") },
+    animate = false,
+  })
+  open_source({ ADD })
+  ask("why?")
+  local answer_win = vim.api.nvim_get_current_win()
+  contains(wait_for_buffer_text("Question: why?"), "Question: why?", "original backend answered")
+  eq(true, vim.wait(WAIT_MS, function()
+    return title_of(answer_win) == " regular · add "
+  end, POLL_MS), "original backend finished")
+
+  pick_backend("quick")
+  feed("<CR>")
+  submit("and then?")
+
+  contains(wait_for_buffer_text("--continue-sid"), "--continue-sid", "the original backend resumed its session")
+end)
+
 test("yaf yanks the whole function including its signature", function()
   use_agent(ECHO_PROMPT)
   open_source({ ADD })

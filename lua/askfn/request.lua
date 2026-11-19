@@ -6,6 +6,7 @@ local M = {}
 ---@field interactive string[] argv that reopens the session interactively; the id is appended
 
 ---@class askfn.Backend
+---@field label string? display name in the backend picker
 ---@field cmd string[] argv of the agent CLI; session flag and question are appended
 ---@field output askfn.OutputFormat how the CLI writes its answer to stdout
 ---@field session askfn.Session? omit when the CLI cannot continue a one-shot run

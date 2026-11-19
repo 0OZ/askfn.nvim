@@ -29,9 +29,15 @@ require("askfn").setup({
   backend = "claude",
   backends = {
     claude = {
+      label = "Claude Code · Sonnet · xhigh",
       cmd = { "sh", root .. "/demo/fake-agent.sh" },
       output = "text",
       session = { start = "--session-id", resume = "--resume", interactive = { "true" } },
+    },
+    ["cursor-grok"] = {
+      label = "Cursor Agent · Grok 4.7",
+      cmd = { "sh", root .. "/demo/fake-agent.sh" },
+      output = "text",
     },
   },
 })

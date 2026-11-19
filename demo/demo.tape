@@ -47,4 +47,17 @@ Sleep 6500ms
 Type "gY"
 Sleep 1500ms
 Type "q"
-Sleep 1200ms
+Sleep 900ms
+
+# switch to Cursor Agent with Grok 4.7 and ask with the usual key
+Type " am"
+Sleep 2600ms
+Type "4"
+Enter
+Sleep 600ms
+Type " aq"
+Sleep 900ms
+Type "what happens at the delay cap?"
+Sleep 300ms
+Enter
+Sleep 6300ms

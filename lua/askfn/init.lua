@@ -24,6 +24,7 @@ local TEXT_SCOPES = { dockerfile = docker.stage_at }
 ---@field ask string|false normal: ask about the function under the cursor; visual: about the selection
 ---@field ask_file string|false like `ask`, and send the whole file along as context
 ---@field ask_type string|false normal: ask about the class, struct, enum or impl around the cursor
+---@field select_backend string|false normal: choose the backend for new questions
 ---@field textobject string|false visual/operator-pending: the whole function including its signature
 ---@field follow_up string|false answer window: ask another question in the same session
 ---@field handoff string|false answer window: continue the conversation interactively
@@ -36,33 +37,52 @@ local TEXT_SCOPES = { dockerfile = docker.stage_at }
 ---@field keys askfn.Keys
 ---@field animate boolean grow the answer window smoothly
 ---@field handoff fun(argv: string[]) opens the interactive agent; `argv` resumes the asked session
+
+---@param model string Claude Code model ID or alias
+---@param effort string Claude Code effort level
+---@param name string display name for the model
+---@return askfn.Backend
+local function claude_backend(model, effort, name)
+  return {
+    label = ("Claude Code · %s · %s"):format(name, effort),
+    cmd = {
+      "claude",
+      "-p",
+      "--model",
+      model,
+      "--effort",
+      effort,
+      "--permission-mode",
+      "plan",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--include-partial-messages",
+    },
+    output = "claude-stream-json",
+    session = { start = "--session-id", resume = "--resume", interactive = { "claude", "--resume" } },
+  }
+end
+
+---@type askfn.Config
 local defaults = {
   backend = "claude",
   backends = {
-    claude = {
-      cmd = {
-        "claude",
-        "-p",
-        "--model",
-        "claude-sonnet-5-5",
-        "--effort",
-        "xhigh",
-        "--permission-mode",
-        "plan",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--include-partial-messages",
-      },
-      output = "claude-stream-json",
-      session = { start = "--session-id", resume = "--resume", interactive = { "claude", "--resume" } },
+    claude = claude_backend("claude-sonnet-5-5", "xhigh", "Sonnet"),
+    ["claude-fast"] = claude_backend("claude-sonnet-5-5", "medium", "Sonnet"),
+    ["claude-opus"] = claude_backend("opus", "high", "Opus"),
+    ["cursor-grok"] = {
+      label = "Cursor Agent · Grok 4.7",
+      cmd = { "cursor-agent", "-p", "--mode", "ask", "--model", "grok-4.7", "--output-format", "text" },
+      output = "text",
     },
-    pi = { cmd = { "pi", "-p", "--thinking", "xhigh" }, output = "text" },
+    pi = { label = "pi · xhigh", cmd = { "pi", "-p", "--thinking", "xhigh" }, output = "text" },
   },
   keys = {
     ask = "<leader>aq",
     ask_file = "<leader>aQ",
     ask_type = "<leader>at",
+    select_backend = "<leader>am",
     textobject = "af",
     follow_up = "<CR>",
     handoff = "o",
@@ -190,7 +210,8 @@ end
 ---@param with_file boolean send the whole file along as context
 ---@param noun string? what the named target is, for the prompt; unused for a plain selection
 local function ask(target, with_file, noun)
-  local executable = config.backends[config.backend].cmd[1]
+  local ask_config = config
+  local executable = ask_config.backends[ask_config.backend].cmd[1]
   if vim.fn.executable(executable) ~= 1 then
     vim.notify(("askfn: %q is not executable"):format(executable), vim.log.levels.ERROR)
     return
@@ -204,14 +225,14 @@ local function ask(target, with_file, noun)
     return
   end
   local file = with_file and file_context(bufnr, code) or nil
-  local label = ("%s · %s"):format(config.backend, target.name or "selection")
+  local label = ("%s · %s"):format(ask_config.backend, target.name or "selection")
   local clear_highlight = highlight(bufnr, target)
 
   input.open((" %s "):format(label), {
     on_cancel = clear_highlight,
     on_submit = function(question)
       conversation.start({
-        config = config,
+        config = ask_config,
         label = label,
         question = question,
         prompt = request.prompt({
@@ -264,6 +285,24 @@ local function map_ask(key, with_file)
   end, { desc = "Ask agent about the selection" .. suffix })
 end
 
+local function select_backend()
+  local backends = config.backends
+  local names = vim.tbl_keys(backends)
+  table.sort(names)
+  local active = config.backend
+  vim.ui.select(names, {
+    prompt = "Ask with",
+    format_item = function(name)
+      local label = backends[name].label or name
+      return name == active and (label .. " (active)") or label
+    end,
+  }, function(backend)
+    if backend then
+      config = vim.tbl_extend("force", config, { backend = backend })
+    end
+  end)
+end
+
 ---@param opts askfn.Config? partial config, merged over the defaults
 function M.setup(opts)
   local merged = vim.tbl_deep_extend("force", defaults, opts or {})
@@ -282,6 +321,9 @@ function M.setup(opts)
     vim.keymap.set("n", keys.ask_type, function()
       ask_at_cursor(symbol.TYPE, false)
     end, { desc = "Ask agent about the class, struct or enum around the cursor" })
+  end
+  if keys.select_backend then
+    vim.keymap.set("n", keys.select_backend, select_backend, { desc = "Select askfn backend" })
   end
   if keys.textobject then
     vim.keymap.set({ "x", "o" }, keys.textobject, select_function, { desc = "Function including signature" })
